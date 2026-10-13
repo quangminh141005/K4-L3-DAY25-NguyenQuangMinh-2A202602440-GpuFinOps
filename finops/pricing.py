@@ -60,21 +60,58 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
-    """Pick a purchasing tier from a workload's duty cycle + interruptibility.
+# Illustrative scenario assumptions, not measured provider interruption rates.
+GPU_INTERRUPT_RATES = {"H100": .05, "H200": .08, "A100": .10,
+                       "A10G": .15, "L4": .12, "B200": .10, "MI300X": .08}
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+
+def tier_costs(hours_per_day, interruptible, *, on_demand_hr=1.0,
+               spot_hr=.6, reserved_1yr_hr=.8, reserved_3yr_hr=.55,
+               gpu_type="H100", interrupt_rate=None, active_days=30,
+               period_days=30, commitment_years=3):
+    """Period costs per GPU; reservations pay for all capacity, including idle time.
+
+    commitment_years is an explicit planning horizon, not an inferred renewal.
     """
-    duty = max(0.0, hours_per_day) / 24.0
-    be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
-        return "spot"
-    if duty >= be:
-        return "reserved"
-    return "on_demand"
+    if not 0 <= hours_per_day <= 24 or not 0 <= active_days <= period_days:
+        raise ValueError("Invalid duty cycle or active days")
+    hours = hours_per_day * active_days
+    costs = {"on_demand": hours * on_demand_hr}
+    if interruptible:
+        rate = GPU_INTERRUPT_RATES.get(gpu_type, .10) if interrupt_rate is None else interrupt_rate
+        costs["spot"] = hours * (1.03 + rate * .5) * spot_hr
+    if commitment_years >= 1:
+        costs["reserved_1yr"] = period_days * 24 * reserved_1yr_hr
+    if commitment_years >= 3:
+        costs["reserved_3yr"] = period_days * 24 * reserved_3yr_hr
+    return costs
+
+
+def recommend_tier(hours_per_day, interruptible, reserved_discount=.45, **kwargs):
+    """Choose the cheapest eligible tier including checkpoint/rework and commitments.
+
+    Legacy calls return 'reserved'; catalog-aware calls identify the term.
+    """
+    legacy = not kwargs
+    kwargs.setdefault("reserved_3yr_hr", 1 - reserved_discount)
+    tier = min((costs := tier_costs(hours_per_day, interruptible, **kwargs)), key=costs.get)
+    return "reserved" if legacy and tier.startswith("reserved_") else tier
+
+
+def cache_is_worth_it(input_tokens, expected_reads, price_in_per_m,
+                     cache_discount=.10, write_multiplier=1.25,
+                     storage_per_m_token_hour=0.0, ttl_hours=1.0, batch_multiplier=1.0):
+    """Cache only when read savings exceed write premium plus storage.
+
+    Reads exclude the initial cache creation. Storage is not batch-discounted.
+    Gemini-style storage and provider write tariffs must be supplied explicitly.
+    """
+    if min(input_tokens, expected_reads, price_in_per_m, ttl_hours) < 0:
+        raise ValueError("Cache inputs must be nonnegative")
+    saved = expected_reads * price_in_per_m * (1 - cache_discount) * batch_multiplier
+    overhead = max(0, write_multiplier - 1) * price_in_per_m * batch_multiplier
+    overhead += storage_per_m_token_hour * ttl_hours
+    return input_tokens > 0 and saved > overhead
 
 
 def spot_checkpoint_cost(
